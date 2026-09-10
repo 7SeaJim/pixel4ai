@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""编辑器入口：pxl-edit [画.pxl]，不给文件就弹窗选择打开或新建。
+
+免安装：ln -s ~/Projects/pixel4ai/bin/pxl-edit ~/.local/bin/pxl-edit
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+try:
+    from pixel4ai.editor import main
+except ImportError as e:
+    print(f"错误: 编辑器需要 PyQt6（Debian: sudo apt install python3-pyqt6）：{e}", file=sys.stderr)
+    sys.exit(1)
+
+sys.exit(main())

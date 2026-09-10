@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+.*.history.json
+.*.history/
+.*.tmp
+
+# 第三方参考原图：只在本地对照，不进版本库（出处见 refs/*/SOURCES.md）
+refs/*/sources/

@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""pixel-art Skill 自带的 pxl 入口：不依赖 PATH，也不用知道项目装在哪。
+
+SKILL.md 里用 ${CLAUDE_SKILL_DIR}/scripts/pxl 调用。Skill 目录一般是
+~/.claude/skills/pixel-art → 软链接到 <项目>/skills/pixel-art，
+resolve() 会顺着软链接找到真实位置，项目根目录就在往上三层。
+
+找项目的顺序：
+    1. 环境变量 PIXEL4AI_HOME（Skill 被复制而不是软链接时用）
+    2. 本脚本真实位置往上三层
+    3. ~/Projects/pixel4ai
+"""
+import os
+import sys
+from pathlib import Path
+
+
+def find_src():
+    here = Path(__file__).resolve()     # <项目>/skills/pixel-art/scripts/pxl
+    candidates = []
+    if os.environ.get("PIXEL4AI_HOME"):
+        candidates.append(Path(os.environ["PIXEL4AI_HOME"]).expanduser() / "src")
+    candidates.append(here.parents[3] / "src")
+    candidates.append(Path.home() / "Projects" / "pixel4ai" / "src")
+    for src in candidates:
+        if (src / "pixel4ai" / "cli.py").is_file():
+            return src
+    return None
+
+
+src = find_src()
+if src is None:
+    print("错误: 找不到 pixel4ai 项目。\n"
+          "  Skill 应该软链接安装：ln -s <项目>/skills/pixel-art ~/.claude/skills/pixel-art\n"
+          "  或者设置环境变量：export PIXEL4AI_HOME=<项目目录>", file=sys.stderr)
+    sys.exit(1)
+
+sys.path.insert(0, str(src))
+
+from pixel4ai.cli import main  # noqa: E402
+
+sys.exit(main())

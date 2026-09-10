@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pixel4ai"
+version = "0.1.0"
+description = "给 AI 用的像素网格画板：一格一色，命令行绘制，导出 PNG / ASCII"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+pxl = "pixel4ai.cli:main"
+pxl-edit = "pixel4ai.editor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
