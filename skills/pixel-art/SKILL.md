@@ -19,7 +19,7 @@ ${CLAUDE_SKILL_DIR}/scripts/pxl 文件.pxl 命令 [参数]
 - 如果你看到的还是字面量 `${CLAUDE_SKILL_DIR}`（比如是直接读了这个文件，而不是通过 Skill 加载），按顺序换用第一个能跑通的：
   1. `pxl`（`command -v pxl` 能找到时）
   2. `~/.claude/skills/pixel-art/scripts/pxl`
-  3. `python3 ~/Projects/pixel4ai/bin/pxl`
+  3. `python3 <pixel4ai 项目目录>/bin/pxl`（常见位置是 `~/Projects/pixel4ai`，可以用 `readlink ~/.claude/skills/pixel-art` 找到项目目录）
 - Bash 工具的每次调用之间**不保留 shell 变量**。不要先 `PXL=...` 再在下一次调用里用 `$PXL`，每条命令都写完整路径。
 - 下文示例为了简洁都写成 `pxl`，执行时换成上面的路径。
 - 画出来的文件放在用户指定的位置；用户没说时，放在当前工作目录。除非用户明确要求，不要写进 pixel4ai 仓库自己的目录（比如 `examples/`）。
