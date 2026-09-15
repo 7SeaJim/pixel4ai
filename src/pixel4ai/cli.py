@@ -8,15 +8,16 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shlex
 import sys
 from pathlib import Path
 
 from . import core, render
-from .core import PRESETS, Canvas, PxlError
+from .core import PRESETS, TRANSPARENT, Canvas, PxlError
 
 FEEDBACK_MARGIN = 2         # 大画布改动后，显示改动范围外扩几格
-READ_ONLY = {"info", "view", "export", "edit"}
+READ_ONLY = {"info", "view", "export", "edit", "inspect"}
 
 
 class Parser(argparse.ArgumentParser):
@@ -48,6 +49,11 @@ def build_parser() -> Parser:
     region(s)
     s.add_argument("--spaced", action="store_true", help="格子之间加空格，逐格核对位置时用")
     s.add_argument("--step", type=int, help="缩略倍数：每个字符代表 N×N 格；1 = 强制逐格（默认自动）")
+    s.add_argument("--outline", action="store_true", help="只显示材质交界（同一色阶里的颜色算同一种材质）")
+
+    s = cmd("inspect", "构图自检：近似直线的交界、没有过渡带的色带、大块平涂；加 --object 检查物体的接触阴影（≤30 行）")
+    s.add_argument("--object", action="append", nargs=4, type=int, metavar=("X0", "Y0", "X1", "Y1"),
+                   help="落地物体的范围，检查它底边下方有没有接触阴影；可以写多个")
 
     s = cmd("palette", "palette | palette set C RRGGBB [C RRGGBB ...] | palette rm C [--replace-with D] | palette preset 名字")
     s.add_argument("action", nargs="?", default="list", choices=["list", "set", "rm", "preset"])
@@ -65,15 +71,53 @@ def build_parser() -> Parser:
         if name != "line":
             s.add_argument("--fill", action="store_true", help="实心")
 
-    s = cmd("fill", "油漆桶（4 连通）：fill X Y C")
+    s = cmd("fill", "油漆桶（4 连通）：fill X Y C [--boundary 字符] [--closed]")
     s.add_argument("x", type=int)
     s.add_argument("y", type=int)
     s.add_argument("c")
+    s.add_argument("--boundary", metavar="字符", help="跨过任何颜色扩散，碰到这些字符才停（先画轮廓再填色时用）")
+    s.add_argument("--closed", action="store_true", help="区域碰到画布边就报错，用来确认轮廓确实围住了")
+
+    def curve_opts(sp):
+        sp.add_argument("--fill", metavar="D", help="从曲线向下（或向上）填充这个颜色")
+        sp.add_argument("--dir", choices=["down", "up"], default="down", help="填充方向，默认 down")
+        sp.add_argument("--until", metavar="字符", help="填充时碰到这些字符就停")
+
+    s = cmd("curve", "经过这些点的平滑曲线（Catmull-Rom），最后一个参数是颜色：curve X Y X Y [X Y …] C；回显高度剖面")
+    s.add_argument("items", nargs="+", metavar="X Y … C")
+    curve_opts(s)
+
+    s = cmd("horizon", "生成一条起伏的地平线 / 山脊（本质是 curve）：horizon Y0 Y1 C；回显等价的 curve 命令和高度剖面")
+    s.add_argument("y0", type=int)
+    s.add_argument("y1", type=int)
+    s.add_argument("c")
+    s.add_argument("--wave", type=int, help="大起伏的幅度（格），默认画布高度的 6%%")
+    s.add_argument("--segments", type=int, help="大起伏的段数，默认每 40 格一段、至少 3 段")
+    s.add_argument("--x0", type=int, help="起点 x，默认 0")
+    s.add_argument("--x1", type=int, help="终点 x，默认画布最右")
+    s.add_argument("--seed", type=int, default=0, help="随机种子，换一个得到不同的起伏")
+    curve_opts(s)
 
     s = cmd("replace", "颜色 A 全部换成 B：replace A B")
     s.add_argument("a")
     s.add_argument("b")
     region(s)
+
+    s = cmd("ramp", "色阶（同一材质从暗到亮）：ramp | ramp set 暗到亮 [暗到亮 ...] | ramp add 暗到亮 | "
+                    "ramp rm 暗到亮 | ramp clear | ramp suggest")
+    s.add_argument("action", nargs="?", default="list", choices=["list", "set", "add", "rm", "clear", "suggest"])
+    s.add_argument("args", nargs="*")
+
+    s = cmd("shade", "按色阶把形状范围内的每一格压暗或提亮（先用 ramp 声明色阶）："
+                     "shade 形状 坐标… [形状 坐标…]，形状是 rect X0 Y0 X1 Y1 / ellipse X0 Y0 X1 Y1 / "
+                     "poly X Y X Y X Y …；多个形状先合并再处理一次，重叠处不会重复压暗")
+    s.add_argument("shapes", nargs="+", metavar="形状 坐标")
+    s.add_argument("--steps", type=int, default=-1, help="移动几档：负数变暗（默认 -1），正数变亮")
+    s.add_argument("--soft", type=int, default=0, help="边缘渐隐宽度（格）：边缘按有序抖动逐渐变稀")
+    s.add_argument("--only", metavar="字符", help="只改这些颜色，比如投影只压暗地面")
+    s.add_argument("--except", dest="skip", metavar="字符", help="不改这些颜色")
+    s.add_argument("--extend", action="store_true",
+                   help="色阶到头时自动在那一端补一个派生颜色（更暗的略偏冷、更亮的略偏暖）")
 
     s = cmd("stamp", "从 (X,Y) 起贴一块子网格，行可不等长：stamp X Y 行 [行 ...]（不给行就读 stdin / 脚本里读到 end）")
     s.add_argument("x", type=int)
@@ -127,7 +171,39 @@ def fmt_region(r) -> str:
 
 
 def is_mutating(ns) -> bool:
-    return ns.cmd not in READ_ONLY and not (ns.cmd == "palette" and ns.action == "list")
+    return (ns.cmd not in READ_ONLY and not (ns.cmd == "palette" and ns.action == "list")
+            and not (ns.cmd == "ramp" and ns.action in ("list", "suggest")))
+
+
+SHAPES = ("rect", "ellipse", "poly")
+
+
+def shade_cells(tokens: list[str]) -> set[tuple[int, int]]:
+    """解析 shade 的形状序列：rect X0 Y0 X1 Y1 / ellipse X0 Y0 X1 Y1 / poly X Y X Y X Y …，可以连着写多个，结果取并集。"""
+    if not tokens or tokens[0] not in SHAPES:
+        raise PxlError("shade 后面要以形状名开头：rect / ellipse / poly")
+    shapes: list[tuple[str, list[int]]] = []
+    for t in tokens:
+        if t in SHAPES:
+            shapes.append((t, []))
+            continue
+        try:
+            shapes[-1][1].append(int(t))
+        except ValueError:
+            raise PxlError(f"shade 参数 {t!r} 既不是形状名（rect / ellipse / poly），也不是整数") from None
+    cells: set[tuple[int, int]] = set()
+    for kind, pts in shapes:
+        if kind in ("rect", "ellipse"):
+            if len(pts) != 4:
+                raise PxlError(f"shade {kind} 要 4 个数：X0 Y0 X1 Y1（实际给了 {len(pts)} 个）")
+            x0, y0, x1, y1 = pts
+            xa, xb, ya, yb = min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1)
+            cells |= core.rect_cells(xa, ya, xb, yb) if kind == "rect" else core.ellipse_cells(xa, ya, xb, yb, True)
+        else:
+            if len(pts) < 6 or len(pts) % 2:
+                raise PxlError("shade poly 要 3 个以上顶点，按 X Y 成对给出")
+            cells |= core.polygon_cells(list(zip(pts[::2], pts[1::2])))
+    return cells
 
 
 def execute(cv: Canvas | None, ns, path: Path, read_rows) -> tuple[Canvas, str | None]:
@@ -140,9 +216,14 @@ def execute(cv: Canvas | None, ns, path: Path, read_rows) -> tuple[Canvas, str |
     if c == "info":
         return cv, render.info(cv, path)
     if c == "view":
-        return cv, view_text(cv, tuple(ns.region) if ns.region else None, ns.spaced, ns.step)
+        return cv, view_text(cv, tuple(ns.region) if ns.region else None, ns.spaced, ns.step, ns.outline)
+    if c == "inspect":
+        from . import lint
+        return cv, lint.report(cv, path.name, [tuple(o) for o in ns.object or []])[0]
     if c == "export":
         return cv, export(cv, ns, path)
+    if c == "ramp" and ns.action in ("list", "suggest"):
+        return cv, render.ramps_text(cv) if ns.action == "list" else render.ramp_suggest_text(cv)
     if c == "palette":
         args = ns.args
         if ns.action == "list":
@@ -160,6 +241,25 @@ def execute(cv: Canvas | None, ns, path: Path, read_rows) -> tuple[Canvas, str |
                 raise PxlError(f"palette preset 名字：{' / '.join(PRESETS)}")
             for ch, color in PRESETS[args[0]].items():
                 cv.set_color(ch, color)
+    elif c == "ramp":
+        if ns.action in ("set", "add", "rm") and not ns.args:
+            raise PxlError(f"ramp {ns.action} 后面要跟色阶，比如 ramp {ns.action} JjHh")
+        if ns.action == "set":
+            cv.set_ramps(ns.args)
+        elif ns.action == "add":
+            cv.set_ramps(cv.ramps + ns.args)
+        elif ns.action == "rm":
+            missing = [r for r in ns.args if r not in cv.ramps]
+            if missing:
+                raise PxlError(f"没有这些色阶：{' '.join(missing)}（现有：{' '.join(cv.ramps) or '无'}）")
+            cv.set_ramps([r for r in cv.ramps if r not in ns.args])
+        else:
+            cv.ramps = []
+    elif c == "shade":
+        cells = shade_cells(ns.shapes)
+        if not any(0 <= x < cv.w and 0 <= y < cv.h for x, y in cells):
+            raise PxlError("shade 的形状完全在画布外面")
+        ns.note = render.shade_note(cv.shade(cells, ns.steps, ns.soft, ns.only, ns.skip, ns.extend), ns.steps)
     elif c == "px":
         if len(ns.items) % 3:
             raise PxlError("px 参数按 X Y C 三个一组")
@@ -176,7 +276,33 @@ def execute(cv: Canvas | None, ns, path: Path, read_rows) -> tuple[Canvas, str |
     elif c in ("rect", "ellipse"):
         getattr(cv, c)(ns.x0, ns.y0, ns.x1, ns.y1, ns.c, ns.fill)
     elif c == "fill":
-        cv.fill(ns.x, ns.y, ns.c)
+        ns.note = render.fill_note(cv.fill(ns.x, ns.y, ns.c, ns.boundary, ns.closed), cv)
+    elif c in ("curve", "horizon"):
+        if c == "curve":
+            *nums, color = ns.items
+            if len(nums) < 4 or len(nums) % 2:
+                raise PxlError("curve 要 2 个以上的点（X Y 成对），最后一个参数是颜色：curve X Y X Y … C")
+            try:
+                vals = [int(v) for v in nums]
+            except ValueError:
+                raise PxlError(f"curve 的坐标要是整数，最后一个参数才是颜色：{' '.join(ns.items)}") from None
+            points, prefix = list(zip(vals[::2], vals[1::2])), ""
+        else:
+            x0 = 0 if ns.x0 is None else ns.x0
+            x1 = cv.w - 1 if ns.x1 is None else ns.x1
+            cv.need_point(x0, 0, "--x0")
+            cv.need_point(x1, 0, "--x1")
+            if x1 - x0 < 8:
+                raise PxlError("horizon 的 x 范围至少要 9 格（--x0 < --x1）")
+            wave = max(1, round(cv.h * 0.06)) if ns.wave is None else ns.wave
+            segments = max(3, round((x1 - x0) / 40)) if ns.segments is None else ns.segments
+            if wave < 0 or segments < 1:
+                raise PxlError("--wave 不能是负数，--segments 至少是 1")
+            points = core.horizon_points(cv.w, cv.h, ns.y0, ns.y1, wave, segments, x0, x1, ns.seed)
+            color = ns.c
+            prefix = "等价于 curve " + " ".join(f"{x} {y}" for x, y in points) + f" {color}；"
+        st = cv.curve(points, color, ns.fill, ns.dir, ns.until)
+        ns.note = prefix + render.curve_note(st, cv, ns.fill, ns.dir, ns.until)
     elif c == "replace":
         cv.replace(ns.a, ns.b, tuple(ns.region) if ns.region else None)
     elif c == "stamp":
@@ -223,14 +349,23 @@ def export(cv: Canvas, ns, path: Path) -> str:
     return f"已导出 {ns.out}"
 
 
-def view_text(cv: Canvas, region=None, spaced: bool = False, step: int | None = None) -> str:
-    """step=None 时自动：区域超过 MAX_VIEW 行/列就缩略，保证输出不会爆掉。"""
+def view_text(cv: Canvas, region=None, spaced: bool = False, step: int | None = None, outline: bool = False) -> str:
+    """step=None 时自动：区域超过 MAX_VIEW 行/列就缩略，保证输出不会爆掉。outline 时只显示材质交界。"""
     r = cv.need_region(region)
     if step is None:
         step = render.auto_step(r[2] - r[0] + 1, r[3] - r[1] + 1)
     if step < 1:
         raise PxlError("--step 至少是 1")
-    return render.view(cv, r, spaced, step)
+    if not outline:
+        return render.view(cv, r, spaced, step)
+    from . import lint
+    lines = render.view(lint.outline_canvas(cv), r, spaced, step).splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*\d+  )(.*)$", line)
+        if m:
+            lines[i] = (m.group(1) + m.group(2).replace(TRANSPARENT, " ")).rstrip()
+    note = "（只显示材质交界；同一色阶里的颜色算同一种材质" + ("" if cv.ramps else "，没声明色阶时每种颜色各算一种") + "）"
+    return note + "\n" + "\n".join(lines)
 
 
 def feedback(cv: Canvas, bbox) -> str:
@@ -278,7 +413,8 @@ def run_script(cv: Canvas | None, text: str, path: Path, parser: Parser) -> tupl
             if out is not None:
                 log.append(f"{lineno:>3}  {ns.cmd}\n{out}")
             else:
-                log.append(f"{lineno:>3}  {ns.cmd}: {change_summary(before, cv)[0]}")
+                note = getattr(ns, "note", None)
+                log.append(f"{lineno:>3}  {ns.cmd}: {change_summary(before, cv)[0]}" + (f"；{note}" if note else ""))
         except (PxlError, ValueError) as e:
             raise PxlError(f"第 {lineno} 行 `{raw}`：{e}\n脚本已中止，{path} 没有被修改") from None
     if cv is None:
@@ -300,7 +436,7 @@ def launch_editor(path: Path | None) -> int:
     return run_editor(path)
 
 
-def dispatch(path: Path, rest: list[str], quiet: bool) -> int:
+def dispatch(path: Path, rest: list[str], quiet: bool, no_lint: bool = False) -> int:
     parser = build_parser()
     ns = parser.parse_args(rest)
     history = core.History(path)
@@ -335,8 +471,9 @@ def dispatch(path: Path, rest: list[str], quiet: bool) -> int:
             return 0
 
     summary, bbox = change_summary(before, cv)
+    note = getattr(ns, "note", None)
     if before is not None and before.same(cv):
-        print(f"没有变化：{summary}")
+        print(f"没有变化：{summary}" + (f"\n  {note}" if note else ""))
         return 0
     if ns.cmd == "new" and before is None:
         history.reset()
@@ -344,6 +481,13 @@ def dispatch(path: Path, rest: list[str], quiet: bool) -> int:
         history.push(before)
     core.save(cv, path)
     print(f"{ns.cmd}: {summary}")
+    if note:
+        print(f"  {note}")
+    if ns.cmd == "apply" and not no_lint:
+        from . import lint
+        lint_line = lint.summary(cv, path.name)
+        if lint_line:
+            print(lint_line)
     if not quiet:
         print(feedback(cv, bbox))
     return 0
@@ -352,7 +496,8 @@ def dispatch(path: Path, rest: list[str], quiet: bool) -> int:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     quiet = any(a in ("-q", "--quiet") for a in argv)
-    argv = [a for a in argv if a not in ("-q", "--quiet")]
+    no_lint = "--no-lint" in argv
+    argv = [a for a in argv if a not in ("-q", "--quiet", "--no-lint")]
     if not argv or argv[0] in ("-h", "--help", "help"):
         print("用法: pxl [-q] 文件.pxl 命令 [参数]    （-q 修改后不打印视图）")
         print("      pxl ref [库] [条目 | --find 关键词 | --list]    查参考库（比如抖动），不需要画布文件\n")
@@ -373,13 +518,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"错误: {e}", file=sys.stderr)
             return 1
     path, rest = Path(argv[0]), argv[1:] or ["view"]
-    commands = {"new", "info", "view", "edit", "palette", "px", "line", "rect", "ellipse", "fill", "replace",
+    commands = {"new", "info", "view", "edit", "inspect", "palette", "ramp", "shade", "curve", "horizon", "px", "line", "rect",
+                "ellipse", "fill", "replace",
                 "stamp", "rows", "mirror", "flip", "shift", "resize", "clear", "undo", "redo", "apply", "export"}
     if argv[0] in commands and not path.exists():
         print(f"错误: 文件要写在命令前面，比如 pxl 画.pxl {argv[0]} ...", file=sys.stderr)
         return 2
     try:
-        return dispatch(path, rest, quiet)
+        return dispatch(path, rest, quiet, no_lint)
     except PxlError as e:
         print(f"错误: {e}", file=sys.stderr)
         return 1

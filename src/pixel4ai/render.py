@@ -1,12 +1,14 @@
 """把画布变成给 AI / 人看的东西：带坐标尺的视图、ASCII、终端真彩色、PNG。"""
 from __future__ import annotations
 
+import math
+import shlex
 import struct
 import zlib
 from collections import Counter
 from pathlib import Path
 
-from .core import TRANSPARENT, Canvas, PxlError, Region, hex_to_rgb, parse_color
+from .core import TRANSPARENT, Canvas, PxlError, Region, hex_to_rgb, parse_color, suggest_ramps
 
 MAX_PNG_SIDE = 8192
 MAX_VIEW = 64               # 文字视图最多显示多少行/列，超过就缩略
@@ -92,6 +94,8 @@ def info(cv: Canvas, path: Path) -> str:
              "调色板"]
     for ch, color in cv.palette.items():
         lines.append(f"  {ch}  {color or '透明':<8} {counts[ch]:>5} 格")
+    if cv.ramps:
+        lines.append("色阶（暗→亮） " + "  ".join(cv.ramps))
     return "\n".join(lines)
 
 
@@ -168,6 +172,88 @@ def png_bytes(cv: Canvas, scale: int = 8, grid: bool = False, bg: str | None = N
             + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
             + chunk(b"IEND", b""))
+
+
+def _lum(color: str) -> float:
+    r, g, b = hex_to_rgb(color)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def ramps_text(cv: Canvas) -> str:
+    if not cv.ramps:
+        return "还没有声明色阶。ramp suggest 给出按色相分组的建议；ramp set 暗到亮 … 声明。"
+    lines = ["色阶（暗 → 亮）："]
+    for r in cv.ramps:
+        lums = [_lum(cv.palette[ch]) for ch in r]
+        warn = "" if all(a <= b for a, b in zip(lums, lums[1:])) else "   ⚠ 顺序不是从暗到亮，shade 会按这个顺序移动"
+        lines.append("  " + " → ".join(f"{ch} {cv.palette[ch]}" for ch in r) + warn)
+    free = [ch for ch, c in cv.palette.items() if c and not any(ch in r for r in cv.ramps)]
+    if free:
+        lines.append("不在任何色阶里（shade 不会改变它们）：" + " ".join(free))
+    return "\n".join(lines)
+
+
+def ramp_suggest_text(cv: Canvas) -> str:
+    groups = suggest_ramps(cv)
+    multi = [g for g in groups if len(g) >= 2]
+    single = [g for g in groups if len(g) == 1]
+    lines = ["按色相分组、组内从暗到亮的建议。这只是起点：色相接近但属于不同材质的颜色"
+             "（比如天空的紫和远山的紫）要手动拆开，否则 shade 会把天空色压到山的颜色上。"]
+    lines += ["  " + " → ".join(f"{ch} {cv.palette[ch]}" for ch in g) for g in multi]
+    if single:
+        lines.append("没有同色相伙伴的单色：" + " ".join(single))
+    if multi:
+        lines.append("按建议声明：pxl 文件.pxl ramp set " + " ".join(shlex.quote(g) for g in multi))
+    return "\n".join(lines)
+
+
+def shade_note(stats: dict, steps: int) -> str:
+    end = "最暗" if steps < 0 else "最亮"
+    parts = [f"{'压暗' if steps < 0 else '提亮'} {stats['changed']} 格"]
+    for ch, color, base in stats.get("added", []):
+        parts.append(f"新增颜色 {ch} {color}（接在 {base} 的{end}一端）")
+    if stats["at_end"]:
+        hint = "，色阶不够长：加 --extend 自动补一个颜色" if stats["at_end"] > stats["changed"] and not stats.get("added") else ""
+        parts.append(f"{stats['at_end']} 格已在色阶{end}一端没变{hint}")
+    if stats["dithered_out"]:
+        parts.append(f"边缘渐隐跳过 {stats['dithered_out']} 格")
+    if stats["filtered"]:
+        parts.append(f"被 --only / --except 排除 {stats['filtered']} 格")
+    if stats["no_ramp"]:
+        chars = " ".join(f"{ch}×{n}" for ch, n in stats["no_ramp"].most_common(8))
+        parts.append(f"⚠ {sum(stats['no_ramp'].values())} 格的颜色不在任何色阶里没变（{chars}），用 ramp add 补上")
+    if stats.get("long_ramps"):
+        parts.append(f"⚠ 色阶 {' '.join(stats['long_ramps'])} 已有 7 档以上：重叠的影子可能在反复压暗，"
+                     "同一光源的影子请把多个形状写进一条 shade")
+    return "；".join(parts)
+
+
+def curve_note(stats: dict, cv: Canvas, fill: str | None, direction: str, until: str | None) -> str:
+    prof = stats["profile"]
+    xs = sorted(prof)
+    ys = [prof[x] for x in xs]
+    amp = max(ys) - min(ys)
+    step = max(1, (xs[-1] - xs[0]) // 16)
+    sampled = xs[::step] + ([xs[-1]] if (len(xs) - 1) % step else [])
+    parts = [f"曲线 {stats['drawn']} 格，x {xs[0]}–{xs[-1]}，y {min(ys)}–{max(ys)}（起伏 {amp} 格）"]
+    if fill is not None:
+        parts.append(f"{'向下' if direction == 'down' else '向上'}填充 {stats['filled']} 格"
+                     + (f"（碰到 {until} 停下）" if until else ""))
+    parts.append("高度剖面 x:y " + " ".join(f"{x}:{prof[x]}" for x in sampled))
+    need = math.ceil(cv.h * 0.03)
+    if xs[-1] - xs[0] + 1 >= cv.w // 2 and amp < need:
+        parts.append(f"⚠ 起伏只有 {amp} 格，不到画布高度的 3%（{need} 格）：看起来会像一条直线")
+    for side, x, n in stats.get("cliffs", []):
+        parts.append(f"⚠ 填充在{side}端 x={x} 形成 {n} 格高的竖直边：之后画的近处一层要能盖住它"
+                     "（端点 y 要低于那一层的地面），否则改成从画布边缘开始")
+    return "；".join(parts)
+
+
+def fill_note(stats: dict, cv: Canvas) -> str:
+    note = f"填充 {stats['filled']} 格（占画布 {stats['filled'] / (cv.w * cv.h):.0%}）"
+    if stats["edges"]:
+        note += "；碰到画布边：" + "、".join(stats["edges"])
+    return note
 
 
 __all__ = ["view", "palette_line", "info", "ascii_art", "ansi", "png_bytes", "TRANSPARENT"]

@@ -115,6 +115,152 @@ class CoreTest(unittest.TestCase):
             self.assertEqual((grid(fwd), n), (["k."], 1))
 
 
+    def test_ramps_roundtrip_and_validation(self):
+        cv = Canvas(3, 1, {"a": "111111", "b": "555555", "c": "999999", "z": "ff0000"})
+        cv.set_ramps(["abc"])
+        again = Canvas.from_dict(json.loads(cv.to_json()))
+        self.assertEqual(again.ramps, ["abc"])
+        self.assertIn('"ramps": ["abc"]', cv.to_json())
+        self.assertTrue(cv.same(again))
+        for bad in (["a"], ["ab", "bc"], ["a.b"], ["aqb"], ["aba"]):
+            with self.assertRaises(PxlError, msg=bad):
+                cv.set_ramps(bad)
+        cv.remove_color("b")
+        self.assertEqual(cv.ramps, ["ac"])
+        cv.remove_color("c")
+        self.assertEqual(cv.ramps, [])
+        self.assertNotIn("ramps", Canvas(1, 1).to_json())
+
+    def test_polygon_cells(self):
+        tri = core.polygon_cells([(0, 0), (6, 0), (0, 6)])
+        for cell in ((0, 0), (6, 0), (0, 6), (1, 1)):
+            self.assertIn(cell, tri)
+        self.assertNotIn((5, 5), tri)
+        thin = core.polygon_cells([(0, 0), (8, 1), (0, 1)])
+        self.assertTrue(all(c in thin for c in core.line_cells(0, 0, 8, 1)))
+        with self.assertRaises(PxlError):
+            core.polygon_cells([(0, 0), (1, 1)])
+
+    def test_shade(self):
+        cv = Canvas(8, 8, {"1": "111111", "2": "444444", "3": "888888", "r": "ff0000"})
+        cv.clear("3")
+        cv.px([(0, 0, "r"), (1, 0, "1")])
+        with self.assertRaisesRegex(PxlError, "色阶"):
+            cv.shade(core.rect_cells(0, 0, 7, 7))
+        cv.set_ramps(["123"])
+        st = cv.shade(core.rect_cells(0, 0, 7, 7), steps=-1)
+        self.assertEqual((cv.grid[3][3], cv.grid[0][0], cv.grid[0][1]), ("2", "r", "1"))
+        self.assertEqual((st["no_ramp"]["r"], st["at_end"], st["changed"]), (1, 1, 62))
+        st = cv.shade(core.rect_cells(0, 0, 7, 7), steps=2, only="2")
+        self.assertEqual(cv.grid[3][3], "3")          # 越过尽头时停在最亮一档
+        self.assertEqual(st["filtered"], 2)
+
+    def test_shade_soft_edge_gets_denser_inward(self):
+        cv = Canvas(61, 61, {"1": "111111", "2": "888888"})
+        cv.clear("2")
+        cv.set_ramps(["12"])
+        disk = core.ellipse_cells(0, 0, 60, 60, True)
+        cv.shade(disk, soft=3)
+        dist = core.inner_distance(disk)
+        density = {d: sum(cv.grid[y][x] == "1" for (x, y), dd in dist.items() if dd == d) /
+                   sum(1 for dd in dist.values() if dd == d) for d in (1, 2, 3)}
+        self.assertLess(density[1], density[2])
+        self.assertLess(density[2], density[3])
+        self.assertLess(density[1], 0.3)
+        self.assertTrue(all(cv.grid[y][x] == "1" for (x, y), dd in dist.items() if dd >= 4))
+        # 直边上不能出现整行全空或整行全满：逐行统计矩形上边缘那一圈
+        cv2 = Canvas(40, 8, {"1": "111111", "2": "888888"})
+        cv2.clear("2")
+        cv2.set_ramps(["12"])
+        cv2.shade(core.rect_cells(0, 0, 39, 7), soft=2)
+        top = sum(cv2.grid[0][x] == "1" for x in range(1, 39))
+        self.assertTrue(0 < top < 38, top)
+
+    def test_shade_extend_adds_darker_color(self):
+        cv = Canvas(4, 4, {"a": "806040", "b": "c09060"})
+        cv.clear("a")
+        cv.set_ramps(["ab"])
+        st = cv.shade(core.rect_cells(0, 0, 3, 3))
+        self.assertEqual((st["changed"], st["at_end"]), (0, 16))
+        st = cv.shade(core.rect_cells(0, 0, 3, 3), extend=True)
+        self.assertEqual(st["changed"], 16)
+        (ch, color, base), = st["added"]
+        self.assertEqual((base, cv.ramps, cv.grid[0][0]), ("a", [ch + "ab"], ch))
+        self.assertLess(render._lum(color), render._lum("#806040"))
+        lighter = cv.shade(core.rect_cells(0, 0, 0, 0), steps=3, extend=True)["added"]
+        self.assertEqual(len(lighter), 1)      # ch→a→b 之后还差 1 档，补 1 个更亮的
+        self.assertGreater(render._lum(lighter[0][1]), render._lum("#c09060"))
+
+    def test_suggest_ramps_splits_materials(self):
+        cv = Canvas(1, 1, {"u": "5a3a22", "v": "8a5a33", "w": "b98252",   # 棕色木头
+                           "o": "ff8c1a", "O": "ffb366",                   # 高饱和橙
+                           "p": "b04a70", "P": "e07aa0"})                  # 粉
+        groups = [set(g) for g in core.suggest_ramps(cv)]
+        for expected in ({"u", "v", "w"}, {"o", "O"}, {"p", "P"}):
+            self.assertIn(expected, groups)
+        self.assertEqual(core.suggest_ramps(cv)[[set(g) for g in core.suggest_ramps(cv)].index({"u", "v", "w"})], "uvw")
+
+
+    def test_catmull_rom_smooth_and_pixel_perfect(self):
+        pts = [(0, 10), (20, 4), (40, 14), (60, 8)]
+        cells = core.catmull_rom_cells(pts)
+        for px, py in pts:
+            self.assertTrue(any(abs(x - px) <= 1 and abs(y - py) <= 1 for x, y in cells), (px, py))
+        for a, b in zip(cells, cells[1:]):
+            self.assertLessEqual(max(abs(a[0] - b[0]), abs(a[1] - b[1])), 1)        # 8 连通，不断开
+        for a, _, c in zip(cells, cells[1:], cells[2:]):
+            self.assertFalse(abs(a[0] - c[0]) == 1 and abs(a[1] - c[1]) == 1, (a, c))  # 没有 L 形拐角
+        with self.assertRaises(PxlError):
+            core.catmull_rom_cells([(0, 0)])
+
+    def test_curve_fill_and_until(self):
+        cv = Canvas(20, 12, {"k": "111111", "g": "448844", "s": "aaccff"})
+        cv.clear("s")
+        cv.rect(0, 10, 19, 11, "k", fill=True)
+        st = cv.curve([(0, 4), (10, 6), (19, 3)], "k", fill="g", until="k")
+        self.assertEqual(set(st["profile"]), set(range(20)))
+        self.assertEqual((cv.grid[9][10], cv.grid[10][10], cv.grid[0][10]), ("g", "k", "s"))
+        with self.assertRaisesRegex(PxlError, "从左到右"):
+            cv.curve([(10, 4), (5, 6), (19, 3)], "k", fill="g")
+        up = Canvas(10, 10, {"k": "111111", "b": "3355aa"})
+        up.curve([(0, 5), (9, 5)], "k", fill="b", direction="up")
+        self.assertEqual((up.grid[0][3], up.grid[5][3], up.grid[8][3]), ("b", "k", "."))
+
+    def test_curve_partial_fill_reports_vertical_edges(self):
+        st = Canvas(40, 20, {"k": "111111"}).curve([(10, 8), (20, 6), (30, 9)], "k", fill="k")
+        self.assertEqual([side for side, _, _ in st["cliffs"]], ["左", "右"])
+        self.assertEqual(st["cliffs"][0][1], 10)
+        full = Canvas(40, 20, {"k": "111111"}).curve([(0, 8), (39, 8)], "k", fill="k")
+        self.assertEqual(full["cliffs"], [])
+        self.assertEqual(Canvas(40, 20, {"k": "111111"}).curve([(10, 8), (30, 9)], "k")["cliffs"], [])   # 不填充不检查
+
+    def test_horizon_points(self):
+        args = (256, 256, 150, 160, 10, 6, 0, 255)
+        a = core.horizon_points(*args, seed=1)
+        self.assertEqual(a, core.horizon_points(*args, seed=1))
+        self.assertNotEqual(a, core.horizon_points(*args, seed=2))
+        self.assertEqual((a[0][0], a[-1][0]), (0, 255))
+        self.assertTrue(all(q[0] > p[0] for p, q in zip(a, a[1:])))
+        ys = [p[1] for p in a]
+        self.assertTrue(150 - 15 <= min(ys) and max(ys) <= 160 + 15, ys)
+
+    def test_fill_boundary_and_closed(self):
+        cv = Canvas(10, 8, {"k": "111111", "r": "ff0000", "g": "00ff00"})
+        cv.rect(2, 2, 7, 6, "k")
+        cv.px([(4, 4, "g")])                              # 轮廓里有杂色，也要一起填
+        st = cv.fill(4, 3, "r", boundary="k", closed=True)
+        self.assertEqual((st["filled"], st["edges"]), (12, []))
+        self.assertEqual((cv.grid[4][4], cv.grid[2][2]), ("r", "k"))
+        cv.px([(7, 4, ".")])                               # 轮廓开一个口
+        before = [r[:] for r in cv.grid]
+        with self.assertRaisesRegex(PxlError, "没有封闭"):
+            cv.fill(4, 3, "g", boundary="k", closed=True)
+        self.assertEqual(cv.grid, before)
+        self.assertEqual(set(cv.fill(4, 3, "g", boundary="k")["edges"]), {"上", "下", "左", "右"})
+        with self.assertRaisesRegex(PxlError, "边界字符"):
+            cv.fill(2, 2, "g", boundary="k")
+
+
 class RenderTest(unittest.TestCase):
     def test_view_rulers(self):
         cv = Canvas(12, 2, {"k": "000000"})
@@ -239,6 +385,55 @@ class CliTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("--force", r.stderr)
 
+    def test_ramp_and_shade_commands(self):
+        self.pxl("s.pxl", "new", "6", "4", "--palette", "gb")
+        r = self.pxl("s.pxl", "shade", "rect", "0", "0", "5", "3")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ramp", r.stderr)
+        self.assertIn("ramp set", self.pxl("s.pxl", "ramp", "suggest").stdout)
+        self.pxl("s.pxl", "clear", "d", "-q")
+        self.assertEqual(self.pxl("s.pxl", "ramp", "set", "abcd", "-q").returncode, 0)
+        r = self.pxl("s.pxl", "apply", stdin="shade ellipse 0 0 5 3 --steps -2\nshade poly 0 0 5 0 0 3 --steps 1 --only b\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("压暗", r.stdout)
+        self.assertIn("提亮", r.stdout)
+        cv = core.load(self.file)
+        self.assertEqual(cv.ramps, ["abcd"])
+        self.assertIn("b", "".join(grid(cv)))
+        self.assertIn("色阶", self.pxl("s.pxl", "info").stdout)
+        r = self.pxl("s.pxl", "shade", "rect", "50", "50", "60", "60")
+        self.assertIn("画布外", r.stderr)
+
+    def test_shade_union_darkens_overlap_once(self):
+        self.pxl("s.pxl", "new", "8", "1", "--palette", "none")
+        self.pxl("s.pxl", "palette", "set", "a", "222222", "b", "555555", "c", "999999", "-q")
+        self.pxl("s.pxl", "clear", "c", "-q")
+        self.pxl("s.pxl", "ramp", "set", "abc", "-q")
+        r = self.pxl("s.pxl", "shade", "rect", "0", "0", "4", "0", "rect", "3", "0", "7", "0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(grid(core.load(self.file)), ["bbbbbbbb"])
+        r = self.pxl("s.pxl", "shade", "rect", "0", "0", "1")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("4 个数", r.stderr)
+        r = self.pxl("s.pxl", "shade", "0", "0", "1", "1")
+        self.assertIn("rect / ellipse / poly", r.stderr)
+
+    def test_curve_horizon_fill_commands(self):
+        self.pxl("s.pxl", "new", "64", "64", "--palette", "pico8")
+        r = self.pxl("s.pxl", "horizon", "30", "34", "g", "--fill", "g", "--seed", "5")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("高度剖面", r.stdout)
+        self.assertIn("等价于 curve", r.stdout)
+        r = self.pxl("s.pxl", "horizon", "40", "40", "b", "--wave", "0", "-q")
+        self.assertIn("像一条直线", r.stdout)
+        r = self.pxl("s.pxl", "apply", stdin="curve 0 50 30 46 63 52 k --fill k\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(core.load(self.file).grid[63][10], "k")
+        r = self.pxl("s.pxl", "fill", "10", "5", "r", "--boundary", "g", "--closed")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("没有封闭", r.stderr)
+        self.assertEqual(self.pxl("s.pxl", "curve", "0", "5", "k").returncode, 1)
+
     def test_large_canvas_feedback_stays_short(self):
         self.pxl("s.pxl", "new", "512", "512")
         r = self.pxl("s.pxl", "rect", "0", "0", "511", "511", "k", "--fill")
@@ -258,6 +453,86 @@ class CliTest(unittest.TestCase):
         r = self.pxl("s.pxl", "export", "png", "--scale", "4", "--grid")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue((self.dir / "s.png").read_bytes().startswith(b"\x89PNG"))
+
+
+class LintTest(unittest.TestCase):
+    """构图自检：交界近似直线、没有过渡带、大块平涂、缺接触阴影、outline。"""
+
+    def scene(self, wavy=False, shaded=False):
+        from pixel4ai import lint  # noqa: F401
+        cv = Canvas(128, 64, {"a": "c9b6e4", "b": "b8a2d6", "G": "4f6d45", "l": "3a5233", "o": "c98d5e"})
+        cv.set_ramps(["ba", "lG"])
+        cv.clear("a")
+        if wavy:
+            cv.curve([(0, 20), (30, 15), (64, 25), (100, 14), (127, 22)], "b", fill="b")
+            cv.curve([(0, 42), (40, 36), (80, 46), (127, 38)], "G", fill="G")
+        else:
+            cv.rect(0, 20, 127, 63, "b", fill=True)
+            cv.rect(0, 40, 127, 63, "G", fill=True)
+            cv.rect(50, 26, 70, 39, "o", fill=True)
+            if shaded:
+                cv.shade(core.ellipse_cells(46, 39, 74, 45, True))
+        return cv
+
+    def test_straight_bands_and_missing_contact_shadow(self):
+        from pixel4ai import lint
+        cv = self.scene()
+        pairs = {(s["a"], s["b"]) for s in lint.analyze(cv)["seams"]}
+        self.assertTrue({("a", "b"), ("b", "G")} <= pairs, pairs)
+        text, warn = lint.report(cv, "t.pxl", objects=[(50, 26, 70, 39)])
+        for needle in ("近似直线", "没有过渡带", "没有接触阴影"):
+            self.assertIn(needle, text)
+        self.assertLessEqual(len(text.splitlines()), 30)
+        ab = next(s for s in lint.analyze(cv)["seams"] if (s["a"], s["b"]) == ("a", "b"))
+        self.assertTrue(ab["gradient"])
+        bg = next(s for s in lint.analyze(cv)["seams"] if (s["a"], s["b"]) == ("b", "G"))
+        self.assertFalse(bg["gradient"])                 # 不同材质之间的清晰边界不算缺过渡
+
+    def test_wavy_bands_not_straight(self):
+        from pixel4ai import lint
+        self.assertNotIn("近似直线", lint.report(self.scene(wavy=True), "t.pxl")[0])
+
+    def test_contact_shadow_found_after_shade(self):
+        from pixel4ai import lint
+        text = lint.report(self.scene(shaded=True), "t.pxl", objects=[(50, 26, 70, 39)])[0]
+        self.assertNotIn("没有接触阴影", text)
+        self.assertIn("✓ 有接触阴影", text)
+
+    def test_contact_check_needs_explicit_objects(self):
+        from pixel4ai import lint
+        text = lint.report(self.scene(), "t.pxl")[0]
+        self.assertIn("--object", text)                 # 不指定物体时只给提示，不猜哪块是物体
+        self.assertNotIn("没有接触阴影", text)
+        self.assertNotIn("接触阴影", lint.summary(self.scene(), "t.pxl") or "")
+        with self.assertRaises(PxlError):
+            lint.report(self.scene(), "t.pxl", objects=[(0, 0, 500, 10)])
+
+    def test_flats_and_outline(self):
+        from pixel4ai import lint
+        cv = self.scene()
+        self.assertEqual(lint.analyze(cv)["flats"][0]["char"], "G")
+        out = lint.outline_canvas(cv)
+        self.assertEqual((out.grid[50][10], out.grid[40][10], out.grid[20][10]), (".", "G", "."))
+
+    def test_inspect_command_and_apply_lint(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = lambda *a, stdin=None: subprocess.run([sys.executable, str(ROOT / "bin" / "pxl"), *a], input=stdin,
+                                                        text=True, capture_output=True, cwd=d, timeout=60)
+            run("s.pxl", "new", "128", "64", "--palette", "none")
+            script = "palette set a c9b6e4 b b8a2d6 G 4f6d45\nclear a\nrect 0 20 127 63 b --fill\nrect 0 40 127 63 G --fill\n"
+            r = run("s.pxl", "apply", "-q", stdin=script)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("构图检查", r.stdout)
+            self.assertNotIn("构图检查", run("s.pxl", "apply", "-q", "--no-lint", stdin="px 0 0 b\n").stdout)
+            r = run("s.pxl", "inspect")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("近似直线", r.stdout)
+            r = run("s.pxl", "inspect", "--object", "10", "10", "20", "19", "--object", "60", "30", "70", "39")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.count("⚠ 没有接触阴影（"), 2)
+            r = run("s.pxl", "view", "--outline", "--region", "0", "15", "20", "45")
+            self.assertIn("只显示材质交界", r.stdout)
+            self.assertIn("G" * 21, r.stdout)
 
 
 class RefsTest(unittest.TestCase):
@@ -454,6 +729,22 @@ class EditorTest(unittest.TestCase):
             out = os.environ.get("PXL_SCREENSHOT")
             if out:
                 win.grab().save(out)
+            win.close()
+
+    def test_editor_keeps_ramps(self):
+        from pixel4ai import editor
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "r.pxl"
+            cv = Canvas(4, 4, {"a": "111111", "b": "999999"})
+            cv.set_ramps(["ab"])
+            core.save(cv, path)
+            win = editor.Editor(path)
+            win.show()
+            win.commit([(1, 1, "a")])
+            self.assertEqual(core.load(path).ramps, ["ab"])
+            win.history_step("undo")
+            self.assertEqual(core.load(path).ramps, ["ab"])
             win.close()
 
     def test_checker_aligned_with_cells(self):
